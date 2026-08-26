@@ -1,4 +1,4 @@
-import http from 'node:http';
+﻿import http from 'node:http';
 import { createReadStream, createWriteStream, existsSync, mkdirSync, promises as fs, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -332,15 +332,28 @@ function publicClip(clip) {
 
 function runProcess(command, args) {
   return new Promise((resolve, reject) => {
-    const process = spawn(command, args, { windowsHide: true });
+    const child = spawn(command, args, { windowsHide: true });
     let stdout = '';
     let stderr = '';
-    process.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-    process.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-    process.on('error', (error) => reject(error));
-    process.on('close', (code) => {
-      if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`${command} exited with code ${code}: ${stderr.slice(-1200)}`));
+
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+    child.on('error', (error) => reject(error));
+
+    child.on('close', (code, signal) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+
+      const reason = signal
+        ? `signal ${signal}`
+        : `exit code ${code}`;
+
+      reject(new Error(
+        `${command} terminated with ${reason}: ${stderr.slice(-2000)}`
+      ));
     });
   });
 }
@@ -740,3 +753,4 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`CLIPPER is listening on 0.0.0.0:${PORT}`);
 });
+
