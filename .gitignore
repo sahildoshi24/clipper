@@ -20,3 +20,5 @@ logs/
 *.jpg
 *.jpeg
 *.png
+
+bin/

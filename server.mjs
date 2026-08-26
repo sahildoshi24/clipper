@@ -24,6 +24,7 @@ const DATABASE_PATH = configuredPath('CLIPPER_DATABASE_PATH', path.join(DATA_DIR
 const USER_ID = 'local-user';
 const PORT = Number(process.env.PORT || 3000);
 const MAX_UPLOAD_BYTES = 1024 * 1024 * 1024; // 1 GB, suitable for local MVP testing.
+const YTDLP_PATH = process.env.CLIPPER_YTDLP_PATH?.trim() || (process.platform === 'win32' ? path.join(ROOT, 'bin', 'yt-dlp.exe') : '/usr/local/bin/yt-dlp');
 
 for (const directory of [DATA_DIR, STORAGE_DIR, LOG_DIR, path.dirname(DATABASE_PATH)]) mkdirSync(directory, { recursive: true });
 
@@ -407,6 +408,47 @@ function updateJob(jobId, status, progress, extras = {}) {
   run(`UPDATE clip_generation_jobs SET ${columns.join(', ')} WHERE id = ?`, ...values);
 }
 
+function isYouTubeUrl(value) {
+  try {
+    const parsed = new URL(value);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    return host === 'youtube.com' || host === 'm.youtube.com' || host === 'youtu.be' || host === 'youtube-nocookie.com';
+  } catch {
+    return false;
+  }
+}
+
+async function downloadYouTubeVideo(sourceUrl, projectId) {
+  if (!existsSync(YTDLP_PATH)) throw new Error('YouTube downloader is not installed on this server.');
+  const tempRelative = storage.projectRelative(projectId, 'source', 'youtube-download');
+  const tempDir = storage.absolute(tempRelative);
+  const sourceRelative = storage.projectRelative(projectId, 'source', 'source.mp4');
+  const sourcePath = storage.absolute(sourceRelative);
+  await fs.rm(tempDir, { recursive: true, force: true });
+  await fs.mkdir(tempDir, { recursive: true });
+  try {
+    await runProcess(YTDLP_PATH, [
+      '--no-playlist', '--no-warnings', '--no-progress', '--restrict-filenames', '--max-filesize', '1G',
+      '--format', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b', '--merge-output-format', 'mp4',
+      '--output', path.join(tempDir, 'download.%(ext)s'), sourceUrl,
+    ]);
+    const entries = await fs.readdir(tempDir, { withFileTypes: true });
+    const candidates = entries.filter((entry) => entry.isFile() && /\.mp4$/i.test(entry.name)).map((entry) => path.join(tempDir, entry.name));
+    if (!candidates.length) throw new Error('YouTube download completed without producing an MP4 file.');
+    const downloaded = candidates[0];
+    const stat = await fs.stat(downloaded);
+    if (!stat.size) throw new Error('Downloaded YouTube video is empty.');
+    if (stat.size > MAX_UPLOAD_BYTES) throw new Error('Downloaded YouTube video exceeds the 1 GB MVP limit.');
+    await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+    await fs.rm(sourcePath, { force: true });
+    await fs.rename(downloaded, sourcePath);
+    return sourceRelative;
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 async function ingestVideo(project, { buffer, originalFilename, mimeType, sourceUrl }) {
   const sourceRelative = storage.projectRelative(project.id, 'source', 'source.mp4');
   const sourcePath = storage.absolute(sourceRelative);
@@ -414,17 +456,22 @@ async function ingestVideo(project, { buffer, originalFilename, mimeType, source
     const timestamp = now();
     run(`UPDATE projects SET status = ?, source_type = COALESCE(?, source_type), source_url = COALESCE(?, source_url), updated_at = ? WHERE id = ?`, status, fields.sourceType || null, fields.sourceUrl || null, timestamp, project.id);
   };
-  updateProject('ingesting', { sourceType: sourceUrl ? 'direct_url' : 'local_upload', sourceUrl });
+  updateProject('ingesting', { sourceType: sourceUrl ? (isYouTubeUrl(sourceUrl) ? 'youtube' : 'direct_url') : 'local_upload', sourceUrl });
   try {
-    if (buffer) await storage.uploadBuffer(buffer, sourceRelative);
-    else await storage.downloadTo(sourceUrl, sourceRelative);
+    if (buffer) {
+      await storage.uploadBuffer(buffer, sourceRelative);
+    } else if (isYouTubeUrl(sourceUrl)) {
+      await downloadYouTubeVideo(sourceUrl, project.id);
+    } else {
+      await storage.downloadTo(sourceUrl, sourceRelative);
+    }
     updateProject('processing');
     const metadata = await probeMedia(sourcePath);
     const videoId = id();
     const timestamp = now();
     run(`INSERT INTO videos (id, project_id, filename, storage_path, mime_type, file_size, duration, width, height, fps, video_codec, audio_codec, status, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)`,
-      videoId, project.id, sanitizeName(originalFilename || path.basename(new URL(sourceUrl).pathname) || 'source.mp4'), sourceRelative,
+      videoId, project.id, sanitizeName(originalFilename || (sourceUrl && isYouTubeUrl(sourceUrl) ? 'youtube-source.mp4' : path.basename(new URL(sourceUrl).pathname) || 'source.mp4')), sourceRelative,
       mimeType || 'video/mp4', metadata.fileSize, metadata.duration, metadata.width, metadata.height, metadata.fps, metadata.videoCodec, metadata.audioCodec, timestamp, timestamp);
     run('UPDATE projects SET source_video_id = ?, status = ?, updated_at = ? WHERE id = ?', videoId, 'created', timestamp, project.id);
     return getVideoForProject(project.id);
@@ -612,8 +659,7 @@ async function handleApi(req, res, url) {
       let parsed;
       try { parsed = new URL(sourceUrl); } catch { throw new HttpError(400, 'Enter a valid HTTP(S) video URL.'); }
       if (!['http:', 'https:'].includes(parsed.protocol)) throw new HttpError(400, 'Only HTTP(S) video URLs are supported.');
-      if (/youtube\.com|youtu\.be/i.test(parsed.hostname)) throw new HttpError(422, 'YouTube ingestion is not enabled in this MVP. Upload a local MP4 or use a permitted direct MP4 URL.');
-      if (!/\.mp4(?:$|[?#])/i.test(parsed.pathname + parsed.search)) throw new HttpError(400, 'Direct URL sources must point to an .mp4 file.');
+      if (!isYouTubeUrl(parsed.toString()) && !/\.mp4(?:$|[?#])/i.test(parsed.pathname + parsed.search)) throw new HttpError(400, 'Direct URL sources must point to an .mp4 file, or enter a supported YouTube URL.');
       if (/^(localhost|127\.|0\.0\.0\.0|\[::1\])/i.test(parsed.hostname)) throw new HttpError(400, 'Local network URLs are not accepted as remote sources. Upload the file instead.');
       video = await ingestVideo(project, { sourceUrl: parsed.toString(), originalFilename: path.basename(parsed.pathname), mimeType: 'video/mp4' });
     }

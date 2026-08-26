@@ -59,7 +59,7 @@ async function dashboard() {
   loading();
   try {
     const [{ projects }, { clips }] = await Promise.all([api('/api/projects'), api('/api/clips')]);
-    app.innerHTML = `<section class="page-head"><div><p class="eyebrow">Projects</p><h1>Real files, not placeholders.</h1><p>Create a project, upload an MP4, and render a persistent, streamable clip using FFmpeg.</p></div><a class="button" href="#create">Create project</a></section>
+    app.innerHTML = `<section class="page-head"><div><p class="eyebrow">Projects</p><h1>Turn videos into real clips.</h1><p>Upload a video or paste a YouTube URL, then render persistent, streamable MP4 clips using FFmpeg.</p></div><a class="button" href="#create">Create project</a></section>
       <section class="grid two"><div><div class="inline" style="justify-content:space-between;margin-bottom:12px"><h2>Projects</h2><span>${projects.length}</span></div>
         <div class="grid">${projects.length ? projects.map(projectCard).join('') : '<div class="empty">No projects yet. Create one to upload a local MP4.</div>'}</div></div>
       <div><div class="inline" style="justify-content:space-between;margin-bottom:12px"><h2>Recent clips</h2><a href="#files">Open File Manager</a></div>
@@ -68,14 +68,14 @@ async function dashboard() {
 }
 
 function createProjectPage() {
-  app.innerHTML = `<section class="page-head"><div><p class="eyebrow">New project</p><h1>Add a real video source.</h1><p>For the functional MVP, local MP4 uploads are the recommended path. The source is copied into persistent server storage before processing.</p></div></section>
+  app.innerHTML = `<section class="page-head"><div><p class="eyebrow">New project</p><h1>Add a video source.</h1><p>Upload a local video or paste a public YouTube URL. The source is downloaded, inspected, and stored before clipping.</p></div></section>
     <section class="card" style="max-width:720px"><form id="create-project-form">
       <label>Project name<input name="name" required maxlength="120" placeholder="e.g. August product interview" /></label>
       <label>Local video file<input name="file" type="file" accept="video/mp4,video/*" /></label>
       <p class="help">The file is uploaded to the server, inspected by FFprobe, and stored as the project source. The MVP upload limit is 1 GB.</p>
       <div class="or">or</div>
-      <label>Direct public MP4 URL<input name="sourceUrl" type="url" placeholder="https://example.com/video.mp4" /></label>
-      <p class="help">YouTube links are deliberately not downloaded. Use an upload or a permitted direct public MP4 URL.</p>
+      <label>YouTube or direct MP4 URL<input name="sourceUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." /></label>
+      <p class="help">YouTube videos are downloaded server-side and stored in persistent Railway storage. Direct sources must be public MP4 files.</p>
       <button type="submit">Create and ingest source</button>
       <div id="form-message"></div>
     </form></section>`;
@@ -91,7 +91,7 @@ async function submitProject(event) {
   const name = String(formData.get('name') || '').trim();
   const file = formData.get('file');
   const sourceUrl = String(formData.get('sourceUrl') || '').trim();
-  if (!(file instanceof File && file.size) && !sourceUrl) { message.innerHTML = '<div class="notice error">Choose a local video file or enter a direct MP4 URL.</div>'; return; }
+  if (!(file instanceof File && file.size) && !sourceUrl) { message.innerHTML = '<div class="notice error">Choose a local video file or enter a YouTube/direct MP4 URL.</div>'; return; }
   if (file instanceof File && file.size && sourceUrl) { message.innerHTML = '<div class="notice error">Choose either a local upload or a URL, not both.</div>'; return; }
   button.disabled = true;
   message.innerHTML = '<div class="notice">Creating project and ingesting the source… this uses the actual file.</div>';
@@ -112,20 +112,30 @@ async function submitProject(event) {
   }
 }
 
+function generatedClipsSection(clips) {
+  return `<section style="margin-top:22px" id="generated-clips"><div class="inline" style="justify-content:space-between;margin-bottom:12px"><div><h2>Generated clips</h2><span class="help">Real MP4 files rendered and saved to persistent storage.</span></div><a class="button secondary compact" href="#files">Open File Manager</a></div>
+    ${clips.length ? `<div class="clip-list">${clips.map((clip) => clipRow(clip)).join('')}</div><section id="project-player-panel" style="margin-top:16px"></section>` : '<div class="empty">No MP4 clips have been generated yet. Choose a candidate above and click Generate actual MP4.</div>'}</section>`;
+}
+
 async function projectPage(projectId) {
   loading('Loading project…');
   try {
-    const { project, video, candidates, jobs } = await api(`/api/projects/${projectId}`);
+    const [{ project, video, candidates, jobs }, { clips }] = await Promise.all([
+      api(`/api/projects/${projectId}`),
+      api(`/api/projects/${projectId}/clips`),
+    ]);
     const failedJob = jobs.find((job) => job.status === 'failed');
     app.innerHTML = `<section class="page-head"><div><p class="eyebrow">Project</p><h1>${escapeHtml(project.name)}</h1><p>Project status: ${status(project.status)}</p></div><div class="inline"><a class="button secondary" href="#files">File Manager</a><a class="button secondary" href="#dashboard">All projects</a></div></section>
       ${project.status === 'failed' ? '<div class="notice error">The last source or processing operation failed. Review the message when performing the next action.</div>' : ''}
       ${video ? sourceSection(project, video) : sourceAttachSection(project)}
       ${video ? analysisSection(project, candidates, failedJob) : ''}
       ${video && candidates.length ? candidatesSection(project, candidates) : ''}
+      ${video ? generatedClipsSection(clips) : ''}
       <section id="project-action-message"></section>`;
     document.querySelector('#analyze')?.addEventListener('click', () => analyze(project.id));
     document.querySelector('#attach-source-form')?.addEventListener('submit', attachSource);
     document.querySelectorAll('[data-generate]').forEach((button) => button.addEventListener('click', () => generate(project.id, button.dataset.generate, button)));
+    document.querySelectorAll('[data-play]').forEach((button) => button.addEventListener('click', () => playProjectClip(button.dataset.play)));
   } catch (error) { renderFailure(error); }
 }
 
@@ -136,7 +146,7 @@ function sourceSection(project, video) {
 }
 
 function sourceAttachSection(project) {
-  return `<section class="card"><h2>Attach a source</h2><p>This project exists but has no source video. Attach a real local MP4 to continue.</p><form id="attach-source-form"><label>Local video file<input name="file" required type="file" accept="video/mp4,video/*" /></label><button type="submit">Store and inspect video</button></form></section>`;
+  return `<section class="card"><h2>Attach a source</h2><p>This project exists but has no source video. Attach a real local video to continue.</p><form id="attach-source-form"><label>Local video file<input name="file" required type="file" accept="video/mp4,video/*" /></label><button type="submit">Store and inspect video</button></form></section>`;
 }
 
 function analysisSection(project, candidates, failedJob) {
@@ -170,9 +180,27 @@ async function analyze(projectId) {
 async function generate(projectId, candidateId, button) {
   button.disabled = true; button.innerHTML = '<span class="spinner"></span>Rendering';
   const actionMessage = document.querySelector('#project-action-message');
-  actionMessage.innerHTML = '<div class="notice">FFmpeg is rendering the selected source range, validating the output MP4, and generating a real thumbnail…</div>';
-  try { const { clip } = await api(`/api/projects/${projectId}/candidates/${candidateId}`, { method: 'POST' }); showToast(`${clip.filename} rendered, validated, and stored.`); projectPage(projectId); }
-  catch (error) { actionMessage.innerHTML = `<div class="notice error">${escapeHtml(error.message)}</div>`; button.disabled = false; button.textContent = 'Retry actual MP4 generation'; }
+  actionMessage.innerHTML = '<div class="notice">FFmpeg is rendering the selected source range, validating the output MP4, and generating a real thumbnail… Keep this page open until rendering finishes.</div>';
+  try {
+    const { clip } = await api(`/api/projects/${projectId}/candidates/${candidateId}`, { method: 'POST' });
+    showToast(`${clip.filename} rendered, validated, and stored.`);
+    await projectPage(projectId);
+    setTimeout(() => document.querySelector('#generated-clips')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+  } catch (error) {
+    actionMessage.innerHTML = `<div class="notice error">${escapeHtml(error.message)}</div>`;
+    button.disabled = false;
+    button.textContent = 'Retry actual MP4 generation';
+  }
+}
+
+async function playProjectClip(clipId) {
+  try {
+    const { clip } = await api(`/api/clips/${clipId}`);
+    const panel = document.querySelector('#project-player-panel');
+    if (!panel) return;
+    panel.innerHTML = `<article class="card"><div class="inline" style="justify-content:space-between"><div><h3>Playing ${escapeHtml(clip.filename)}</h3><p class="help">This is the actual rendered MP4 stored by CLIPPER.</p></div><a class="button secondary" href="${clip.downloadUrl}">Download MP4</a></div><div style="margin-top:15px"><video controls autoplay preload="metadata" src="${clip.videoUrl}"></video></div></article>`;
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (error) { showToast(error.message, true); }
 }
 
 async function filesPage() {
