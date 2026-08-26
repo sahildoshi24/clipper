@@ -428,11 +428,19 @@ async function downloadYouTubeVideo(sourceUrl, projectId) {
   await fs.rm(tempDir, { recursive: true, force: true });
   await fs.mkdir(tempDir, { recursive: true });
   try {
-    await runProcess(YTDLP_PATH, [
+    const ytDlpArgs = [
       '--no-playlist', '--no-warnings', '--no-progress', '--restrict-filenames', '--max-filesize', '1G',
       '--format', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b', '--merge-output-format', 'mp4',
-      '--output', path.join(tempDir, 'download.%(ext)s'), sourceUrl,
-    ]);
+      '--output', path.join(tempDir, 'download.%(ext)s'),
+    ];
+    if (process.env.CLIPPER_YTDLP_POT_ENABLED === '1') {
+      ytDlpArgs.push(
+        '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
+        '--extractor-args', 'youtube:player-client=mweb',
+      );
+    }
+    ytDlpArgs.push(sourceUrl);
+    await runProcess(YTDLP_PATH, ytDlpArgs);
     const entries = await fs.readdir(tempDir, { withFileTypes: true });
     const candidates = entries.filter((entry) => entry.isFile() && /\.mp4$/i.test(entry.name)).map((entry) => path.join(tempDir, entry.name));
     if (!candidates.length) throw new Error('YouTube download completed without producing an MP4 file.');
