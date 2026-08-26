@@ -21,7 +21,7 @@ RUN apt-get update \
     && cd /opt/bgutil/server \
     && npm ci --no-audit --no-fund \
     && npm install --no-save typescript \
-    && npx tsc \
+    && ./node_modules/.bin/tsc \
     && mkdir -p /root/yt-dlp-plugins/bgutil-ytdlp-pot-provider \
     && cp -r /opt/bgutil/plugin/. /root/yt-dlp-plugins/bgutil-ytdlp-pot-provider/ \
     && rm -rf /var/lib/apt/lists/*
@@ -39,5 +39,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/health').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))"
 
 CMD ["sh", "-c", "node /opt/bgutil/server/build/main.js >/tmp/bgutil-provider.log 2>&1 & exec npm start"]
+
+
 
 
