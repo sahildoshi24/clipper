@@ -42,9 +42,9 @@ The included Dockerfile uses Node 22 LTS and installs FFmpeg (which includes FFp
 
 The implementation is deliberately single-user for local development (`local-user`). It applies ownership checks against that local user on every project/video/clip lookup, so a multi-user authentication layer can replace that identity boundary later.
 
-## Source URLs
+## Video sources
 
-Direct public HTTP(S) `.mp4` URLs are supported as a separate source adapter. YouTube URLs are recognized and rejected with a clear message: this MVP does not download YouTube videos, avoiding any attempt to bypass platform restrictions. Use a local MP4 to validate the processing pipeline.
+CLIPPER accepts local video-file uploads only. URL-based video ingestion, including YouTube links and direct MP4 URLs, is not part of this application.
 
 ## Persistence locations
 

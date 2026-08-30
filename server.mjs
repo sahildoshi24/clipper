@@ -1,10 +1,9 @@
 ﻿import http from 'node:http';
-import { createReadStream, createWriteStream, existsSync, mkdirSync, promises as fs, statSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, promises as fs, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { pipeline } from 'node:stream/promises';
 import { DatabaseSync } from 'node:sqlite';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -24,7 +23,6 @@ const DATABASE_PATH = configuredPath('CLIPPER_DATABASE_PATH', path.join(DATA_DIR
 const USER_ID = 'local-user';
 const PORT = Number(process.env.PORT || 3000);
 const MAX_UPLOAD_BYTES = 1024 * 1024 * 1024; // 1 GB, suitable for local MVP testing.
-const YTDLP_PATH = process.env.CLIPPER_YTDLP_PATH?.trim() || (process.platform === 'win32' ? path.join(ROOT, 'bin', 'yt-dlp.exe') : '/usr/local/bin/yt-dlp');
 
 for (const directory of [DATA_DIR, STORAGE_DIR, LOG_DIR, path.dirname(DATABASE_PATH)]) mkdirSync(directory, { recursive: true });
 
@@ -37,7 +35,6 @@ db.exec(`
     user_id TEXT NOT NULL,
     name TEXT NOT NULL,
     source_type TEXT,
-    source_url TEXT,
     source_video_id TEXT,
     status TEXT NOT NULL DEFAULT 'created',
     created_at TEXT NOT NULL,
@@ -138,23 +135,6 @@ class LocalStorageService {
     const destination = this.absolute(relativePath);
     await fs.mkdir(path.dirname(destination), { recursive: true });
     await fs.writeFile(destination, buffer);
-    return relativePath;
-  }
-
-  async downloadTo(sourceUrl, relativePath) {
-    const destination = this.absolute(relativePath);
-    await fs.mkdir(path.dirname(destination), { recursive: true });
-    const response = await fetch(sourceUrl, { redirect: 'error', signal: AbortSignal.timeout(90_000) });
-    if (!response.ok || !response.body) throw new HttpError(422, `Direct-video download failed (${response.status}).`);
-    const length = Number(response.headers.get('content-length') || 0);
-    if (length > MAX_UPLOAD_BYTES) throw new HttpError(413, 'Remote video exceeds the 1 GB MVP limit.');
-    await pipeline(response.body, createWriteStream(destination, { flags: 'w' }));
-    const stat = await fs.stat(destination);
-    if (!stat.size) throw new HttpError(422, 'Remote video download produced an empty file.');
-    if (stat.size > MAX_UPLOAD_BYTES) {
-      await fs.rm(destination, { force: true });
-      throw new HttpError(413, 'Remote video exceeds the 1 GB MVP limit.');
-    }
     return relativePath;
   }
 
@@ -291,7 +271,6 @@ function publicProject(project) {
     id: project.id,
     name: project.name,
     sourceType: project.source_type,
-    sourceUrl: project.source_url,
     sourceVideoId: project.source_video_id,
     status: project.status,
     createdAt: project.created_at,
@@ -421,78 +400,23 @@ function updateJob(jobId, status, progress, extras = {}) {
   run(`UPDATE clip_generation_jobs SET ${columns.join(', ')} WHERE id = ?`, ...values);
 }
 
-function isYouTubeUrl(value) {
-  try {
-    const parsed = new URL(value);
-    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
-    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
-    return host === 'youtube.com' || host === 'm.youtube.com' || host === 'youtu.be' || host === 'youtube-nocookie.com';
-  } catch {
-    return false;
-  }
-}
-
-async function downloadYouTubeVideo(sourceUrl, projectId) {
-  if (!existsSync(YTDLP_PATH)) throw new Error('YouTube downloader is not installed on this server.');
-  const tempRelative = storage.projectRelative(projectId, 'source', 'youtube-download');
-  const tempDir = storage.absolute(tempRelative);
-  const sourceRelative = storage.projectRelative(projectId, 'source', 'source.mp4');
-  const sourcePath = storage.absolute(sourceRelative);
-  await fs.rm(tempDir, { recursive: true, force: true });
-  await fs.mkdir(tempDir, { recursive: true });
-  try {
-    const ytDlpArgs = [
-      '--no-playlist', '--no-warnings', '--no-progress', '--restrict-filenames', '--max-filesize', '1G',
-      '--format', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b', '--merge-output-format', 'mp4',
-      '--output', path.join(tempDir, 'download.%(ext)s'),
-    ];
-    if (process.env.CLIPPER_YTDLP_POT_ENABLED === '1') {
-      ytDlpArgs.push(
-        '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
-        '--extractor-args', 'youtube:player-client=mweb',
-      );
-    }
-    ytDlpArgs.push(sourceUrl);
-    await runProcess(YTDLP_PATH, ytDlpArgs);
-    const entries = await fs.readdir(tempDir, { withFileTypes: true });
-    const candidates = entries.filter((entry) => entry.isFile() && /\.mp4$/i.test(entry.name)).map((entry) => path.join(tempDir, entry.name));
-    if (!candidates.length) throw new Error('YouTube download completed without producing an MP4 file.');
-    const downloaded = candidates[0];
-    const stat = await fs.stat(downloaded);
-    if (!stat.size) throw new Error('Downloaded YouTube video is empty.');
-    if (stat.size > MAX_UPLOAD_BYTES) throw new Error('Downloaded YouTube video exceeds the 1 GB MVP limit.');
-    await fs.mkdir(path.dirname(sourcePath), { recursive: true });
-    await fs.rm(sourcePath, { force: true });
-    await fs.rename(downloaded, sourcePath);
-    return sourceRelative;
-  } finally {
-    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
-  }
-}
-
-async function ingestVideo(project, { buffer, originalFilename, mimeType, sourceUrl }) {
+async function ingestVideo(project, { buffer, originalFilename, mimeType }) {
   const sourceRelative = storage.projectRelative(project.id, 'source', 'source.mp4');
   const sourcePath = storage.absolute(sourceRelative);
   const updateProject = (status, fields = {}) => {
     const timestamp = now();
-    run(`UPDATE projects SET status = ?, source_type = COALESCE(?, source_type), source_url = COALESCE(?, source_url), updated_at = ? WHERE id = ?`, status, fields.sourceType || null, fields.sourceUrl || null, timestamp, project.id);
+    run(`UPDATE projects SET status = ?, source_type = COALESCE(?, source_type), updated_at = ? WHERE id = ?`, status, fields.sourceType || null, timestamp, project.id);
   };
-  updateProject('ingesting', { sourceType: sourceUrl ? (isYouTubeUrl(sourceUrl) ? 'youtube' : 'direct_url') : 'local_upload', sourceUrl });
+  updateProject('ingesting', { sourceType: 'local_upload' });
   try {
-    if (buffer) {
-      await storage.uploadBuffer(buffer, sourceRelative);
-    } else if (isYouTubeUrl(sourceUrl)) {
-      await downloadYouTubeVideo(sourceUrl, project.id);
-    } else {
-      await storage.downloadTo(sourceUrl, sourceRelative);
-    }
+    await storage.uploadBuffer(buffer, sourceRelative);
     updateProject('processing');
     const metadata = await probeMedia(sourcePath);
     const videoId = id();
     const timestamp = now();
     run(`INSERT INTO videos (id, project_id, filename, storage_path, mime_type, file_size, duration, width, height, fps, video_codec, audio_codec, status, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)`,
-      videoId, project.id, sanitizeName(originalFilename || (sourceUrl && isYouTubeUrl(sourceUrl) ? 'youtube-source.mp4' : path.basename(new URL(sourceUrl).pathname) || 'source.mp4')), sourceRelative,
+      videoId, project.id, sanitizeName(originalFilename), sourceRelative,
       mimeType || 'video/mp4', metadata.fileSize, metadata.duration, metadata.width, metadata.height, metadata.fps, metadata.videoCodec, metadata.audioCodec, timestamp, timestamp);
     run('UPDATE projects SET source_video_id = ?, status = ?, updated_at = ? WHERE id = ?', videoId, 'created', timestamp, project.id);
     return getVideoForProject(project.id);
@@ -668,22 +592,11 @@ async function handleApi(req, res, url) {
     const project = getProject(resourceId);
     if (row('SELECT id FROM videos WHERE project_id = ?', project.id)) throw new HttpError(409, 'This project already has a source video. Create another project for a different source.');
     const type = req.headers['content-type'] || '';
-    let video;
-    if (type.startsWith('multipart/form-data')) {
-      const parts = parseMultipart(await readBody(req), type);
-      const file = parts.find((part) => part.name === 'file' && part.filename);
-      if (!file || !file.data.length) throw new HttpError(400, 'Select a non-empty local video file.');
-      video = await ingestVideo(project, { buffer: file.data, originalFilename: file.filename, mimeType: file.mimeType });
-    } else {
-      const body = await readJson(req);
-      const sourceUrl = String(body.sourceUrl || '').trim();
-      let parsed;
-      try { parsed = new URL(sourceUrl); } catch { throw new HttpError(400, 'Enter a valid HTTP(S) video URL.'); }
-      if (!['http:', 'https:'].includes(parsed.protocol)) throw new HttpError(400, 'Only HTTP(S) video URLs are supported.');
-      if (!isYouTubeUrl(parsed.toString()) && !/\.mp4(?:$|[?#])/i.test(parsed.pathname + parsed.search)) throw new HttpError(400, 'Direct URL sources must point to an .mp4 file, or enter a supported YouTube URL.');
-      if (/^(localhost|127\.|0\.0\.0\.0|\[::1\])/i.test(parsed.hostname)) throw new HttpError(400, 'Local network URLs are not accepted as remote sources. Upload the file instead.');
-      video = await ingestVideo(project, { sourceUrl: parsed.toString(), originalFilename: path.basename(parsed.pathname), mimeType: 'video/mp4' });
-    }
+    if (!type.startsWith('multipart/form-data')) throw new HttpError(415, 'Video sources must be uploaded as a local file.');
+    const parts = parseMultipart(await readBody(req), type);
+    const file = parts.find((part) => part.name === 'file' && part.filename);
+    if (!file || !file.data.length) throw new HttpError(400, 'Select a non-empty local video file.');
+    const video = await ingestVideo(project, { buffer: file.data, originalFilename: file.filename, mimeType: file.mimeType });
     return sendJson(res, 201, { video: publicVideo(video) });
   }
   if (resource === 'projects' && resourceId && action === 'source' && subAction === 'video' && method === 'GET') {

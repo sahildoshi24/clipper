@@ -59,7 +59,7 @@ async function dashboard() {
   loading();
   try {
     const [{ projects }, { clips }] = await Promise.all([api('/api/projects'), api('/api/clips')]);
-    app.innerHTML = `<section class="page-head"><div><p class="eyebrow">Projects</p><h1>Turn videos into real clips.</h1><p>Upload a video or paste a YouTube URL, then render persistent, streamable MP4 clips using FFmpeg.</p></div><a class="button" href="#create">Create project</a></section>
+    app.innerHTML = `<section class="page-head"><div><p class="eyebrow">Projects</p><h1>Turn videos into real clips.</h1><p>Upload a video, then render persistent, streamable MP4 clips using FFmpeg.</p></div><a class="button" href="#create">Create project</a></section>
       <section class="grid two"><div><div class="inline" style="justify-content:space-between;margin-bottom:12px"><h2>Projects</h2><span>${projects.length}</span></div>
         <div class="grid">${projects.length ? projects.map(projectCard).join('') : '<div class="empty">No projects yet. Create one to upload a local MP4.</div>'}</div></div>
       <div><div class="inline" style="justify-content:space-between;margin-bottom:12px"><h2>Recent clips</h2><a href="#files">Open File Manager</a></div>
@@ -68,14 +68,11 @@ async function dashboard() {
 }
 
 function createProjectPage() {
-  app.innerHTML = `<section class="page-head"><div><p class="eyebrow">New project</p><h1>Add a video source.</h1><p>Upload a local video or paste a public YouTube URL. The source is downloaded, inspected, and stored before clipping.</p></div></section>
+  app.innerHTML = `<section class="page-head"><div><p class="eyebrow">New project</p><h1>Add a video source.</h1><p>Upload a local video file. It is inspected and stored before clipping.</p></div></section>
     <section class="card" style="max-width:720px"><form id="create-project-form">
       <label>Project name<input name="name" required maxlength="120" placeholder="e.g. August product interview" /></label>
-      <label>Local video file<input name="file" type="file" accept="video/mp4,video/*" /></label>
+      <label>Local video file<input name="file" required type="file" accept="video/mp4,video/*" /></label>
       <p class="help">The file is uploaded to the server, inspected by FFprobe, and stored as the project source. The MVP upload limit is 1 GB.</p>
-      <div class="or">or</div>
-      <label>YouTube or direct MP4 URL<input name="sourceUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." /></label>
-      <p class="help">YouTube videos are downloaded server-side and stored in persistent Railway storage. Direct sources must be public MP4 files.</p>
       <button type="submit">Create and ingest source</button>
       <div id="form-message"></div>
     </form></section>`;
@@ -90,20 +87,14 @@ async function submitProject(event) {
   const formData = new FormData(form);
   const name = String(formData.get('name') || '').trim();
   const file = formData.get('file');
-  const sourceUrl = String(formData.get('sourceUrl') || '').trim();
-  if (!(file instanceof File && file.size) && !sourceUrl) { message.innerHTML = '<div class="notice error">Choose a local video file or enter a YouTube/direct MP4 URL.</div>'; return; }
-  if (file instanceof File && file.size && sourceUrl) { message.innerHTML = '<div class="notice error">Choose either a local upload or a URL, not both.</div>'; return; }
+  if (!(file instanceof File && file.size)) { message.innerHTML = '<div class="notice error">Choose a non-empty local video file.</div>'; return; }
   button.disabled = true;
   message.innerHTML = '<div class="notice">Creating project and ingesting the source… this uses the actual file.</div>';
   try {
     const { project } = await api('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
-    if (file instanceof File && file.size) {
-      const upload = new FormData();
-      upload.append('file', file, file.name);
-      await api(`/api/projects/${project.id}/source`, { method: 'POST', body: upload });
-    } else {
-      await api(`/api/projects/${project.id}/source`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceUrl }) });
-    }
+    const upload = new FormData();
+    upload.append('file', file, file.name);
+    await api(`/api/projects/${project.id}/source`, { method: 'POST', body: upload });
     showToast('Source stored and metadata extracted.');
     setRoute(`project/${project.id}`);
   } catch (error) {

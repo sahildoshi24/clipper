@@ -2,6 +2,8 @@
 .gitignore
 .dockerignore
 node_modules
+bin
+*.backup
 data
 storage
 logs
